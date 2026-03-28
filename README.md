@@ -13,7 +13,7 @@ Edit the filters at the top of `scraper.py`.
 
 ```bash
 pip install playwright
-playwright install chromium
+python -m playwright install chromium
 ```
 
 ### 2. Configure your email (Gmail recommended)

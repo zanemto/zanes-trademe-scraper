@@ -13,13 +13,20 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 # ── Filters (edit these to change your search) ──────────────────────────────
-MAKE      = "toyota"
-YEAR_MIN  = 2005
-MIN_PRICE = 1000
-MAX_PRICE = 7500
-MAX_KMS   = 180_000
-REGION_ID = 2               # TradeMe "user_region" id for Auckland
+FILTER_SETS = [
+    {
+        "name": "Mercedes C200",
+        "make": "mercedes-benz",
+        "model": "c-200",
+        "year_min": 2010,
+        "min_price": None,
+        "max_price": 15000,
+        "max_kms": 140_000,
+        "region_id": None,  # TradeMe "user_region" id (None = any)
+    },
+]
 MAX_PAGES = 5
+YEAR_WINDOW = 2  # compare within ± this many years
 # ────────────────────────────────────────────────────────────────────────────
 
 DB_PATH = Path(__file__).with_name("trademe_cars.db")
@@ -29,6 +36,7 @@ DB_PATH = Path(__file__).with_name("trademe_cars.db")
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA journal_mode=WAL")
     con.execute("""
         CREATE TABLE IF NOT EXISTS listings (
             listing_id   TEXT PRIMARY KEY,
@@ -42,6 +50,10 @@ def init_db():
             date_scraped TEXT,
             is_new       INTEGER DEFAULT 1
         )
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_listings_make_model_year
+        ON listings (make, model, year)
     """)
     con.commit()
     return con
@@ -329,16 +341,31 @@ async def scrape_page(page, url: str) -> list[dict]:
     return listings
 
 
-def build_base_url(make: str, region_id: int, min_price: int, max_price: int, max_kms: int, year_min: int) -> str:
-    return (
-        f"https://www.trademe.co.nz/a/motors/cars/{make}/search"
-        f"?user_region={region_id}"
-        f"&price_min={min_price}"
-        f"&price_max={max_price}"
-        f"&odometer_max={max_kms}"
-        f"&sort_order=motorslatestlistings"
-        f"&year_min={year_min}"
-    )
+def build_base_url(
+    make: str,
+    model: str | None,
+    region_id: int | None,
+    min_price: int | None,
+    max_price: int | None,
+    max_kms: int | None,
+    year_min: int | None,
+) -> str:
+    model_path = f"/{model}" if model else ""
+    base = f"https://www.trademe.co.nz/a/motors/cars/{make}{model_path}/search"
+
+    params = ["auto_category_jump=false"]
+    if year_min is not None:
+        params.append(f"year_min={year_min}")
+    if max_kms is not None:
+        params.append(f"odometer_max={max_kms}")
+    if max_price is not None:
+        params.append(f"price_max={max_price}")
+    if min_price is not None:
+        params.append(f"price_min={min_price}")
+    if region_id is not None:
+        params.append(f"user_region={region_id}")
+
+    return base + "?" + "&".join(params)
 
 
 async def scrape_all_pages(base_url: str, max_pages: int = MAX_PAGES) -> list[dict]:
@@ -364,6 +391,9 @@ async def scrape_all_pages(base_url: str, max_pages: int = MAX_PAGES) -> list[di
                 page_listings = await scrape_page(page, url)
                 # print(f"    Found {len(page_listings)} listings")
                 all_listings.extend(page_listings)
+                if not page_listings:
+                    # Stop early if this page has no results
+                    break
             except Exception as e:
                 print(f"  ❌ Error on page {page_num}: {e}")
                 break
@@ -389,7 +419,7 @@ def score_deals(con, new_listings: list[dict]) -> list[dict]:
         if not car["price"]:
             continue
 
-        # Comparable listings: same make, same model, year within ±3
+        # Comparable listings: same make, same model, year within ±YEAR_WINDOW
         year = car["year"] or 2000
         rows = con.execute("""
             SELECT price FROM listings
@@ -398,7 +428,7 @@ def score_deals(con, new_listings: list[dict]) -> list[dict]:
               AND year BETWEEN ? AND ?
               AND price IS NOT NULL
               AND listing_id != ?
-        """, (car["make"], car["model"], year - 3, year + 3, car["listing_id"])).fetchall()
+        """, (car["make"], car["model"], year - YEAR_WINDOW, year + YEAR_WINDOW, car["listing_id"])).fetchall()
 
         prices = [r[0] for r in rows]
 
@@ -425,26 +455,40 @@ def score_deals(con, new_listings: list[dict]) -> list[dict]:
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 async def run():
-    base_url = build_base_url(
-        make=MAKE,
-        region_id=REGION_ID,
-        min_price=MIN_PRICE,
-        max_price=MAX_PRICE,
-        max_kms=MAX_KMS,
-        year_min=YEAR_MIN,
-    )
-
     print(f"\nTradeMe Car Scraper — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(
-        f"Filters: make {MAKE}  |  year >= {YEAR_MIN}  |  "
-        f"min ${MIN_PRICE:,}  |  max ${MAX_PRICE:,}  |  "
-        f"max {MAX_KMS:,} km  |  region id {REGION_ID}\n"
-    )
+
+    def format_filter_set(fset: dict) -> str:
+        parts = [
+            f"make {fset.get('make')}",
+            f"model {fset.get('model')}" if fset.get("model") else None,
+            f"year >= {fset.get('year_min')}" if fset.get("year_min") is not None else None,
+            f"min ${fset.get('min_price'):,}" if fset.get("min_price") is not None else None,
+            f"max ${fset.get('max_price'):,}" if fset.get("max_price") is not None else None,
+            f"max {fset.get('max_kms'):,} km" if fset.get("max_kms") is not None else None,
+            f"region id {fset.get('region_id')}" if fset.get("region_id") is not None else None,
+        ]
+        label = fset.get("name") or fset.get("make") or "Filter set"
+        return f"{label}: " + "  |  ".join(p for p in parts if p)
+
+    for fset in FILTER_SETS:
+        print(format_filter_set(fset))
+    print("")
 
     con = init_db()
 
     print("Scraping TradeMe...")
-    all_listings = await scrape_all_pages(base_url=base_url, max_pages=MAX_PAGES)
+    all_listings = []
+    for fset in FILTER_SETS:
+        base_url = build_base_url(
+            make=fset.get("make"),
+            model=fset.get("model"),
+            region_id=fset.get("region_id"),
+            min_price=fset.get("min_price"),
+            max_price=fset.get("max_price"),
+            max_kms=fset.get("max_kms"),
+            year_min=fset.get("year_min"),
+        )
+        all_listings.extend(await scrape_all_pages(base_url=base_url, max_pages=MAX_PAGES))
     print(f"\nScraped {len(all_listings)} listings total")
 
     new_listings = save_listings(con, all_listings)
@@ -463,8 +507,8 @@ async def run():
 if __name__ == "__main__":
     results = asyncio.run(run())
     if results:
-        print(f"\nTop 5 deals:")
-        for car in results[:5]:
+        print(f"\nTop 10 deals:")
+        for car in results[:10]:
             print(
                 f"  {car['saving_pct']:.0f}%  ${car['price']:,}  "
                 f"(median ${car['median_comp']:,})  — {car['title'][:60]}"

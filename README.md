@@ -3,7 +3,7 @@
 Scrapes new TradeMe listings, scores them against historical prices,
 and emails the top 5 deals from the latest scrape.
 
-Edit the filters at the top of `scraper.py`.
+Edit the filters at the top of `scraper.py` (you can add multiple filter sets).
 
 ---
 
@@ -52,7 +52,55 @@ python mailer.py
 
 ---
 
+## Multiple filter sets
+
+You can scrape multiple filter sets in one run by editing `FILTER_SETS` in `scraper.py`:
+
+```python
+FILTER_SETS = [
+    {
+        "name": "Mercedes C200",
+        "make": "mercedes-benz",
+        "model": "c-200",
+        "year_min": 2010,
+        "min_price": None,
+        "max_price": 15000,
+        "max_kms": 140_000,
+        "region_id": None,
+    },
+    {
+        "name": "Toyota Corolla",
+        "make": "toyota",
+        "model": "corolla",
+        "year_min": 2012,
+        "min_price": 3000,
+        "max_price": 12000,
+        "max_kms": 160_000,
+        "region_id": 2,
+    },
+]
+```
+
+Each filter set is scraped in sequence and all results are combined into one run.
+The database stores listings from all filter sets together, and scoring uses
+historical listings that match the same make/model and year window.
+
+---
+
 ## Run it every day automatically
+
+### Windows (Task Scheduler)
+
+1. Open **Task Scheduler** -> Create Basic Task
+2. Set trigger: **Daily** at 8:00 AM
+3. Action: **Start a program** (create two tasks, 5 minutes apart)
+   - Program: `python`
+   - Arguments: `scraper.py` (first task)
+   - Start in: `C:\path\to\trademe_scraper`
+4. Second task:
+   - Program: `python`
+   - Arguments: `mailer.py` (second task)
+   - Start in: `C:\path\to\trademe_scraper`
 
 ### Mac / Linux (cron)
 
@@ -70,25 +118,16 @@ Add these lines to run every morning at 8am:
 Replace `/path/to/trademe_scraper` with the actual folder path
 (e.g. `/Users/yourname/trademe_scraper`).
 
-### Windows (Task Scheduler)
-
-1. Open **Task Scheduler** -> Create Basic Task
-2. Set trigger: **Daily** at 8:00 AM
-3. Action: **Start a program** (create two tasks, 5 minutes apart)
-   - Program: `python`
-   - Arguments: `scraper.py` (first task)
-   - Start in: `C:\path\to\trademe_scraper`
-4. Second task:
-   - Program: `python`
-   - Arguments: `mailer.py` (second task)
-   - Start in: `C:\path\to\trademe_scraper`
-
 ---
 
 ## How the deal scoring works
 
 Each new listing is compared to the **median price** of similar cars
-(same make, same model, year within ±3 years) already in the database.
+(same make, same model, year within ±2 years by default) already in the database.
+You can change this with `YEAR_WINDOW` in `scraper.py`.
+
+The database uses WAL mode and an index on `(make, model, year)` for faster
+performance as it grows.
 The score is **price as a percentage of the median** (lower is better).
 
 | Score | Meaning |

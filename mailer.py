@@ -8,21 +8,39 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
-from scraper import (
-    init_db,
-    score_deals,
-    MAKE,
-    YEAR_MIN,
-    MIN_PRICE,
-    MAX_PRICE,
-    MAX_KMS,
-    REGION_ID,
-)
+from scraper import init_db, score_deals, FILTER_SETS
 import config
 
 
 def build_html_email(deals: list[dict]) -> str:
     """Build a clean HTML email body from the scored deals list."""
+    def build_filter_text() -> str:
+        lines = []
+        for fset in FILTER_SETS:
+            parts = [f"make {fset.get('make')}"]
+            if fset.get("model"):
+                parts.append(f"model {fset.get('model')}")
+            if fset.get("year_min") is not None:
+                parts.append(f"year ≥ {fset.get('year_min')}")
+            min_price = fset.get("min_price")
+            max_price = fset.get("max_price")
+            if min_price is not None or max_price is not None:
+                if min_price is not None and max_price is not None:
+                    parts.append(f"price ${min_price:,}–${max_price:,}")
+                elif min_price is not None:
+                    parts.append(f"price ≥ ${min_price:,}")
+                else:
+                    parts.append(f"price ≤ ${max_price:,}")
+            if fset.get("max_kms") is not None:
+                parts.append(f"max {fset.get('max_kms'):,} km")
+            if fset.get("region_id") is not None:
+                parts.append(f"region id {fset.get('region_id')}")
+            parts.append("newest first")
+
+            label = fset.get("name") or fset.get("make") or "Filter set"
+            lines.append(f"{label}: " + " · ".join(parts))
+
+        return "<br>".join(lines)
 
     def deal_badge(pct: float) -> str:
         # pct is price as % of median (lower is better)
@@ -33,7 +51,7 @@ def build_html_email(deals: list[dict]) -> str:
         return '<span style="background:#6b7280;color:#fff;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:bold;">New listing</span>'
 
     rows = ""
-    for car in deals[:5]:   # cap at 5 listings per email
+    for car in deals[:10]:   # cap at 10 listings per email
         kms = f"{car['kilometres']:,} km" if car.get("kilometres") else "km unknown"
         saving_color = "#16a34a" if car["saving_pct"] <= 90 else "#374151"
         saving_text  = f"{car['saving_pct']:.0f}% of median ${car['median_comp']:,}"
@@ -90,7 +108,7 @@ def build_html_email(deals: list[dict]) -> str:
         <!-- Footer -->
         <div style="padding:20px 32px;background:#f9fafb;border-top:1px solid #e5e7eb;">
           <p style="color:#9ca3af;font-size:12px;margin:0;">
-            Filters: make {MAKE} · year ≥ {YEAR_MIN} · price ${MIN_PRICE:,}–${MAX_PRICE:,} · max {MAX_KMS:,} km · region id {REGION_ID} · newest first<br>
+            Filters: {build_filter_text()}<br>
             Deal scores compare against median price of similar cars in your local database.
             Scores improve as more data is collected over time.
           </p>
@@ -167,7 +185,7 @@ def main():
         print("No deals to email.")
         return
 
-    top_deals = deals[:5]
+    top_deals = deals[:10]
     html = build_html_email(top_deals)
     send_email(html, len(top_deals))
 

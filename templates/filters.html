@@ -1,0 +1,223 @@
+{% extends "base.html" %}
+{% block content %}
+
+<h4 class="mb-4">Filters</h4>
+
+<ul class="nav nav-tabs mb-4" id="filterTabs">
+  <li class="nav-item">
+    <button class="nav-link active" onclick="showTab('scraper', this)">Scraper Filters</button>
+  </li>
+  <li class="nav-item">
+    <button class="nav-link" onclick="showTab('mailer', this)">Mailer Filters</button>
+  </li>
+</ul>
+
+<!-- Scraper Filters -->
+<div id="tab-scraper">
+  <p class="text-muted small mb-3">
+    Each filter set controls one TradeMe search. The scraper runs all of them and saves results to the database.
+  </p>
+  <div class="card mb-3">
+    <div class="card-body d-flex align-items-center gap-3">
+      <label class="form-label mb-0 fw-semibold" for="max-pages">Max pages per filter set</label>
+      <input type="number" id="max-pages" class="form-control form-control-sm" style="width:90px;" min="1" value="">
+      <span class="text-muted small">Each page has ~20 listings</span>
+    </div>
+  </div>
+  <div id="scraper-list"></div>
+  <div class="d-flex gap-2 mt-2">
+    <button class="btn btn-outline-secondary btn-sm" onclick="addFilter('scraper')">+ Add filter set</button>
+    <button class="btn btn-primary btn-sm" onclick="saveFilters('scraper')">Save scraper filters</button>
+    <span class="text-success small align-self-center" id="scraper-saved" style="display:none;">Saved!</span>
+  </div>
+</div>
+
+<!-- Mailer Filters -->
+<div id="tab-mailer" style="display:none;">
+  <p class="text-muted small mb-3">
+    Each filter set generates one email. Listings are matched case-insensitively against scraped make/model values.
+  </p>
+  <div id="mailer-list"></div>
+  <div class="d-flex gap-2 mt-2">
+    <button class="btn btn-outline-secondary btn-sm" onclick="addFilter('mailer')">+ Add filter set</button>
+    <button class="btn btn-primary btn-sm" onclick="saveFilters('mailer')">Save mailer filters</button>
+    <span class="text-success small align-self-center" id="mailer-saved" style="display:none;">Saved!</span>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const scraperConfig  = {{ scraper_config | tojson }};
+const mailerFilters  = {{ mailer_filters | tojson }};
+
+function showTab(name, btn) {
+  document.getElementById('tab-scraper').style.display = name === 'scraper' ? '' : 'none';
+  document.getElementById('tab-mailer').style.display  = name === 'mailer'  ? '' : 'none';
+  document.querySelectorAll('#filterTabs .nav-link').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+}
+
+function esc(str) {
+  return String(str ?? '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+}
+
+function classifiedsOpts(val) {
+  const opts = [['', 'Both'], ['true', 'Classifieds only'], ['false', 'Auctions only']];
+  const cur = val === null || val === undefined ? '' : String(val);
+  return opts.map(([v, label]) =>
+    `<option value="${v}" ${cur === v ? 'selected' : ''}>${label}</option>`
+  ).join('');
+}
+
+function filterCardHtml(fset, isMailer) {
+  const modelVal = Array.isArray(fset.model) ? fset.model.join(', ') : (fset.model ?? '');
+  return `
+  <div class="card mb-3 filter-card">
+    <div class="card-body">
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <span class="fw-semibold">${esc(fset.name) || 'Unnamed filter'}</span>
+        <button type="button" class="btn btn-sm btn-outline-danger"
+          onclick="this.closest('.filter-card').remove()">Remove</button>
+      </div>
+      <div class="row g-2">
+        <div class="col-md-4">
+          <label class="form-label form-label-sm">Name</label>
+          <input type="text" class="form-control form-control-sm" name="name" value="${esc(fset.name)}">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label form-label-sm">Make <span class="text-muted">(blank = any)</span></label>
+          <input type="text" class="form-control form-control-sm" name="make" value="${esc(fset.make)}">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label form-label-sm">Model ${isMailer ? '<span class="text-muted">(comma-sep for multiple)</span>' : ''}<span class="text-muted"> (blank = any)</span></label>
+          <input type="text" class="form-control form-control-sm" name="model" value="${esc(modelVal)}">
+        </div>
+        <div class="col-md-2">
+          <label class="form-label form-label-sm">Year min</label>
+          <input type="number" class="form-control form-control-sm" name="year_min" value="${fset.year_min ?? ''}">
+        </div>
+        <div class="col-md-2">
+          <label class="form-label form-label-sm">Min price</label>
+          <input type="number" class="form-control form-control-sm" name="min_price" value="${fset.min_price ?? ''}">
+        </div>
+        <div class="col-md-2">
+          <label class="form-label form-label-sm">Max price</label>
+          <input type="number" class="form-control form-control-sm" name="max_price" value="${fset.max_price ?? ''}">
+        </div>
+        <div class="col-md-2">
+          <label class="form-label form-label-sm">Max kms</label>
+          <input type="number" class="form-control form-control-sm" name="max_kms" value="${fset.max_kms ?? ''}">
+        </div>
+        <div class="col-md-2">
+          <label class="form-label form-label-sm">Region ID</label>
+          <input type="number" class="form-control form-control-sm" name="region_id" value="${fset.region_id ?? ''}">
+        </div>
+        <div class="col-md-2">
+          <label class="form-label form-label-sm">Listing type</label>
+          <select class="form-select form-select-sm" name="classifieds">
+            ${classifiedsOpts(fset.classifieds)}
+          </select>
+        </div>
+        ${isMailer ? `
+        <div class="col-md-2">
+          <label class="form-label form-label-sm">Year window <span class="text-muted">(±)</span></label>
+          <input type="number" class="form-control form-control-sm" name="year_window" value="${fset.year_window ?? 2}">
+        </div>
+        <div class="col-md-2">
+          <label class="form-label form-label-sm">KM window <span class="text-muted">(± blank=any)</span></label>
+          <input type="number" class="form-control form-control-sm" name="km_window" value="${fset.km_window ?? ''}">
+        </div>
+        <div class="col-md-2">
+          <label class="form-label form-label-sm">Days back</label>
+          <input type="number" class="form-control form-control-sm" name="days_back" value="${fset.days_back ?? 3}">
+        </div>
+        ` : ''}
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderFilters(type, data) {
+  const isMailer = type === 'mailer';
+  document.getElementById(type + '-list').innerHTML =
+    data.length ? data.map(f => filterCardHtml(f, isMailer)).join('') : '';
+}
+
+function addFilter(type) {
+  const isMailer = type === 'mailer';
+  const blank = {
+    name: '', make: '', model: '', year_min: null, min_price: null,
+    max_price: null, max_kms: null, region_id: null, classifieds: null,
+    ...(isMailer ? { year_window: 2, km_window: null, days_back: 3 } : {}),
+  };
+  document.getElementById(type + '-list').insertAdjacentHTML(
+    'beforeend', filterCardHtml(blank, isMailer)
+  );
+}
+
+function collectFilters(type) {
+  const isMailer = type === 'mailer';
+  const cards = document.querySelectorAll('#' + type + '-list .filter-card');
+  return Array.from(cards).map(card => {
+    const val  = name => (card.querySelector(`[name="${name}"]`)?.value ?? '').trim();
+    const num  = name => { const v = val(name); return v === '' ? null : Number(v); };
+
+    const modelStr = val('model');
+    let model = null;
+    if (modelStr) {
+      model = isMailer && modelStr.includes(',')
+        ? modelStr.split(',').map(s => s.trim()).filter(Boolean)
+        : modelStr;
+    }
+
+    const classifiedsRaw = val('classifieds');
+    const classifieds = classifiedsRaw === '' ? null : classifiedsRaw === 'true';
+
+    return {
+      name:       val('name') || null,
+      make:       val('make') || null,
+      model,
+      year_min:   num('year_min'),
+      min_price:  num('min_price'),
+      max_price:  num('max_price'),
+      max_kms:    num('max_kms'),
+      region_id:  num('region_id'),
+      classifieds,
+      ...(isMailer ? {
+        year_window: num('year_window') ?? 2,
+        km_window:   num('km_window'),
+        days_back:   num('days_back') ?? 3,
+      } : {}),
+    };
+  });
+}
+
+function saveFilters(type) {
+  let data;
+  if (type === 'scraper') {
+    data = {
+      max_pages: Number(document.getElementById('max-pages').value) || 10,
+      filter_sets: collectFilters('scraper'),
+    };
+  } else {
+    data = collectFilters('mailer');
+  }
+  fetch('/filters/' + type, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  }).then(r => r.json()).then(() => {
+    const el = document.getElementById(type + '-saved');
+    el.style.display = '';
+    setTimeout(() => el.style.display = 'none', 2000);
+  });
+}
+
+// Init
+document.getElementById('max-pages').value = scraperConfig.max_pages ?? 10;
+renderFilters('scraper', scraperConfig.filter_sets ?? []);
+renderFilters('mailer',  mailerFilters);
+</script>
+{% endblock %}

@@ -1,0 +1,36 @@
+[
+  {
+    "name": "Cars newer than 2005",
+    "make": null,
+    "model": null,
+    "year_min": 2005,
+    "min_price": 1100,
+    "max_price": 7500,
+    "max_kms": 200000,
+    "region_id": 2,
+    "classifieds": true,
+    "year_window": 2,
+    "km_window": 50000,
+    "days_back": 4
+  },
+  {
+    "name": "Mercedes Mimi",
+    "make": "Mercedes",
+    "model": [
+      "C 180",
+      "C 200",
+      "C 250",
+      "C 300",
+      "C 350"
+    ],
+    "year_min": 2010,
+    "min_price": null,
+    "max_price": 15000,
+    "max_kms": 140000,
+    "region_id": null,
+    "classifieds": null,
+    "year_window": 2,
+    "km_window": 50000,
+    "days_back": 3
+  }
+]

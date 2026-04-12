@@ -1,10 +1,11 @@
 """
 Zanes TradeMe Car Scraper
-Scrapes newly listed cars from TradeMe matching your filters,
-scores them for value, and emails you the best deals when you run mailer.py.
+Scrapes newly listed cars from TradeMe matching your filters and saves them to the DB.
+Run mailer.py separately to score deals and send the email report.
 """
 
 import asyncio
+import json
 import random
 import re
 import sqlite3
@@ -12,24 +13,16 @@ from datetime import datetime
 from pathlib import Path
 from playwright.async_api import async_playwright
 
-# ── Filters (edit these to change your search) ──────────────────────────────
-FILTER_SETS = [
-    {
-        "name": "Mercedes C200",
-        "make": "mercedes-benz",
-        "model": "c-200",
-        "year_min": 2010,
-        "min_price": None,
-        "max_price": 15000,
-        "max_kms": 140_000,
-        "region_id": None,  # TradeMe "user_region" id (None = any)
-    },
-]
-MAX_PAGES = 5
-YEAR_WINDOW = 2  # compare within ± this many years
-# ────────────────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).parent
+DB_PATH  = BASE_DIR / "trademe_cars.db"
+FILTERS_PATH = BASE_DIR / "scraper_filters.json"
 
-DB_PATH = Path(__file__).with_name("trademe_cars.db")
+
+def load_scraper_config() -> dict:
+    """Load scraper config (max_pages + filter sets) from scraper_filters.json."""
+    if FILTERS_PATH.exists():
+        return json.loads(FILTERS_PATH.read_text())
+    return {"max_pages": 10, "filter_sets": []}
 
 
 # ── Database setup ────────────────────────────────────────────────────────────
@@ -48,6 +41,8 @@ def init_db():
             model        TEXT,
             url          TEXT,
             date_scraped TEXT,
+            listed_as    TEXT,
+            region_id    INTEGER,
             is_new       INTEGER DEFAULT 1
         )
     """)
@@ -55,6 +50,12 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_listings_make_model_year
         ON listings (make, model, year)
     """)
+    # Migrate existing DBs that predate the listed_as column
+    existing = {row[1] for row in con.execute("PRAGMA table_info(listings)").fetchall()}
+    if "listed_as" not in existing:
+        con.execute("ALTER TABLE listings ADD COLUMN listed_as TEXT")
+    if "region_id" not in existing:
+        con.execute("ALTER TABLE listings ADD COLUMN region_id INTEGER")
     con.commit()
     return con
 
@@ -66,12 +67,13 @@ def save_listings(con, listings: list[dict]) -> list[dict]:
         try:
             con.execute("""
                 INSERT INTO listings
-                  (listing_id, title, price, kilometres, year, make, model, url, date_scraped)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  (listing_id, title, price, kilometres, year, make, model, url, date_scraped, listed_as, region_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 car["listing_id"], car["title"], car["price"],
                 car["kilometres"], car["year"], car["make"],
                 car["model"], car["url"], car["date_scraped"],
+                car.get("listed_as"), car.get("region_id"),
             ))
             new_ones.append(car)
         except sqlite3.IntegrityError:
@@ -349,9 +351,11 @@ def build_base_url(
     max_price: int | None,
     max_kms: int | None,
     year_min: int | None,
+    classifieds: bool | None = None,
 ) -> str:
+    make_path = f"/{make}" if make else ""
     model_path = f"/{model}" if model else ""
-    base = f"https://www.trademe.co.nz/a/motors/cars/{make}{model_path}/search"
+    base = f"https://www.trademe.co.nz/a/motors/cars{make_path}{model_path}/search"
 
     params = ["auto_category_jump=false"]
     if year_min is not None:
@@ -364,11 +368,15 @@ def build_base_url(
         params.append(f"price_min={min_price}")
     if region_id is not None:
         params.append(f"user_region={region_id}")
+    if classifieds is True:
+        params.append("listed_as=classifieds")
+    elif classifieds is False:
+        params.append("listed_as=auctions")
 
     return base + "?" + "&".join(params)
 
 
-async def scrape_all_pages(base_url: str, max_pages: int = MAX_PAGES) -> list[dict]:
+async def scrape_all_pages(base_url: str, max_pages: int = 10) -> list[dict]:
     """Scrape up to max_pages of results."""
     all_listings = []
 
@@ -406,55 +414,9 @@ async def scrape_all_pages(base_url: str, max_pages: int = MAX_PAGES) -> list[di
     return all_listings
 
 
-# ── Deal scoring ──────────────────────────────────────────────────────────────
-
-def score_deals(con, new_listings: list[dict]) -> list[dict]:
-    """
-    Score each new listing against the median price of similar cars
-    already in the database (same make, similar year ±3 years).
-    Falls back to overall median if not enough comps exist.
-    """
-    scored = []
-    for car in new_listings:
-        if not car["price"]:
-            continue
-
-        # Comparable listings: same make, same model, year within ±YEAR_WINDOW
-        year = car["year"] or 2000
-        rows = con.execute("""
-            SELECT price FROM listings
-            WHERE make = ?
-              AND model = ?
-              AND year BETWEEN ? AND ?
-              AND price IS NOT NULL
-              AND listing_id != ?
-        """, (car["make"], car["model"], year - YEAR_WINDOW, year + YEAR_WINDOW, car["listing_id"])).fetchall()
-
-        prices = [r[0] for r in rows]
-
-        if len(prices) >= 3:
-            median = sorted(prices)[len(prices) // 2]
-        else:
-            # Fall back to overall median in DB
-            all_rows = con.execute(
-                "SELECT price FROM listings WHERE price IS NOT NULL"
-            ).fetchall()
-            all_prices = sorted(r[0] for r in all_rows)
-            median = all_prices[len(all_prices) // 2] if all_prices else car["price"]
-
-        price_pct = round((car["price"] / median) * 100, 1)
-        car["median_comp"] = median
-        car["saving_pct"]  = price_pct
-        scored.append(car)
-
-    # Sort best deals first (lower % of median is better)
-    scored.sort(key=lambda c: c["saving_pct"])
-    return scored
-
-
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-async def run():
+async def run(selected_names: set | None = None):
     print(f"\nTradeMe Car Scraper — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
     def format_filter_set(fset: dict) -> str:
@@ -470,7 +432,18 @@ async def run():
         label = fset.get("name") or fset.get("make") or "Filter set"
         return f"{label}: " + "  |  ".join(p for p in parts if p)
 
-    for fset in FILTER_SETS:
+    config = load_scraper_config()
+    filter_sets = config.get("filter_sets", [])
+    max_pages = config.get("max_pages", 10)
+
+    if selected_names is not None:
+        filter_sets = [f for f in filter_sets if f.get("name") in selected_names]
+
+    if not filter_sets:
+        print("No filter sets configured. Add some in the UI or scraper_filters.json.")
+        return
+
+    for fset in filter_sets:
         print(format_filter_set(fset))
     print("")
 
@@ -478,7 +451,8 @@ async def run():
 
     print("Scraping TradeMe...")
     all_listings = []
-    for fset in FILTER_SETS:
+    for fset in filter_sets:
+        classifieds = fset.get("classifieds")
         base_url = build_base_url(
             make=fset.get("make"),
             model=fset.get("model"),
@@ -487,32 +461,31 @@ async def run():
             max_price=fset.get("max_price"),
             max_kms=fset.get("max_kms"),
             year_min=fset.get("year_min"),
+            classifieds=classifieds,
         )
-        all_listings.extend(await scrape_all_pages(base_url=base_url, max_pages=MAX_PAGES))
+        listed_as = "classifieds" if classifieds is True else ("auctions" if classifieds is False else None)
+        scraped = await scrape_all_pages(base_url=base_url, max_pages=max_pages)
+        for listing in scraped:
+            listing["listed_as"] = listed_as
+            listing["region_id"] = fset.get("region_id")
+        all_listings.extend(scraped)
     print(f"\nScraped {len(all_listings)} listings total")
 
     new_listings = save_listings(con, all_listings)
     print(f"{len(new_listings)} are new (not seen before)")
+    con.close()
 
     if not new_listings:
         print("Nothing new today.")
-        con.close()
-        return
-
-    scored = score_deals(con, new_listings)
-    con.close()
-    return scored
+    else:
+        print("\nRun mailer.py to send the email report.")
 
 
 if __name__ == "__main__":
-    results = asyncio.run(run())
-    if results:
-        print(f"\nTop 10 deals:")
-        for car in results[:10]:
-            print(
-                f"  {car['saving_pct']:.0f}%  ${car['price']:,}  "
-                f"(median ${car['median_comp']:,})  — {car['title'][:60]}"
-            )
-            if car.get("url"):
-                print(f"     {car['url']}")
-        print("\nRun mailer.py to send the email report.")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--filters", type=str, default=None,
+                        help="Comma-separated filter set names to run (default: all)")
+    args = parser.parse_args()
+    selected = set(args.filters.split(",")) if args.filters else None
+    asyncio.run(run(selected_names=selected))

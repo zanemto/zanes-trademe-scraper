@@ -1,38 +1,42 @@
 """
 TradeMe Car Deal Mailer
-Runs the scraper then emails you the best new deals.
+Reads listings from the DB, scores them for deal value, and emails you the best ones.
 Configure your email settings in config.py before running.
 """
 
+import json
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
-from scraper import init_db, score_deals
+from pathlib import Path
+from scraper import init_db
 import config
 
-# ── Mail filter sets (edit these to control which emails you receive) ─────────
-# Each entry generates one email. make/model are matched case-insensitively
-# against what was extracted from listing titles — e.g. "Mercedes", not "mercedes-benz".
-MAIL_FILTER_SETS = [
-    {
-        "make": "Mercedes",
-        "model": None,
-        "year_min": 2010,
-        "min_price": None,
-        "max_price": 15000,
-        "max_kms": 140_000,
-    },
-]
-# ─────────────────────────────────────────────────────────────────────────────
+FILTERS_PATH = Path(__file__).parent / "mailer_filters.json"
+
+
+def load_mail_filter_sets() -> list[dict]:
+    """Load mailer filter sets from mailer_filters.json."""
+    if FILTERS_PATH.exists():
+        return json.loads(FILTERS_PATH.read_text())
+    return []
 
 
 def build_html_email(deals: list[dict], fset: dict) -> str:
     """Build a clean HTML email body from the scored deals list."""
+    def model_display(fset: dict) -> str | None:
+        m = fset.get("model")
+        if not m:
+            return None
+        return "/".join(m) if isinstance(m, list) else m
+
     def build_filter_text() -> str:
-        parts = [f"make {fset.get('make')}"]
-        if fset.get("model"):
-            parts.append(f"model {fset.get('model')}")
+        parts = []
+        if fset.get("make"):
+            parts.append(f"make {fset.get('make')}")
+        if model_display(fset):
+            parts.append(f"model {model_display(fset)}")
         if fset.get("year_min") is not None:
             parts.append(f"year ≥ {fset.get('year_min')}")
         min_price = fset.get("min_price")
@@ -50,7 +54,7 @@ def build_html_email(deals: list[dict], fset: dict) -> str:
             parts.append(f"region id {fset.get('region_id')}")
         parts.append("newest first")
 
-        label = " ".join(p for p in [fset.get("make"), fset.get("model")] if p) or "Filter set"
+        label = fset.get("name") or " ".join(p for p in [fset.get("make"), model_display(fset)] if p) or "Filter set"
         return label + ": " + " · ".join(parts)
 
     def deal_badge(pct: float) -> str:
@@ -95,7 +99,7 @@ def build_html_email(deals: list[dict], fset: dict) -> str:
 
         <!-- Header -->
         <div style="background:#1e3a5f;padding:28px 32px;">
-          <h1 style="color:#fff;margin:0;font-size:22px;">TradeMe Deal Report — {" ".join(p for p in [fset.get("make"), fset.get("model")] if p) or "All"}</h1>
+          <h1 style="color:#fff;margin:0;font-size:22px;">TradeMe Deal Report — {fset.get("name") or " ".join(p for p in [fset.get("make"), model_display(fset)] if p) or "All"}</h1>
           <p style="color:#93c5fd;margin:6px 0 0;font-size:14px;">{date_str}</p>
         </div>
 
@@ -149,12 +153,58 @@ def send_email(html_body: str, num_deals: int, filter_name: str = ""):
     print("Email sent!")
 
 
-def fetch_latest_listings(con) -> list[dict]:
-    """Fetch all listings scraped within the last 3 days."""
-    since = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+def score_deals(con, new_listings: list[dict], year_window: int = 2, km_window: int | None = None) -> list[dict]:
+    """
+    Score each new listing against the median price of similar cars
+    already in the database (same make/model, year within ±year_window,
+    optionally kilometres within ±km_window).
+    Falls back to overall median if not enough comps exist.
+    """
+    scored = []
+    for car in new_listings:
+        if not car["price"]:
+            continue
+
+        year = car["year"] or 2000
+
+        query = """
+            SELECT price FROM listings
+            WHERE make = ?
+              AND model = ?
+              AND year BETWEEN ? AND ?
+              AND price IS NOT NULL
+              AND listing_id != ?
+        """
+        params: list = [car["make"], car["model"], year - year_window, year + year_window, car["listing_id"]]
+
+        if km_window is not None and car.get("kilometres"):
+            query += " AND kilometres BETWEEN ? AND ?"
+            params += [car["kilometres"] - km_window, car["kilometres"] + km_window]
+
+        rows = con.execute(query, params).fetchall()
+        prices = [r[0] for r in rows]
+
+        if len(prices) >= 3:
+            median = sorted(prices)[len(prices) // 2]
+        else:
+            all_rows = con.execute("SELECT price FROM listings WHERE price IS NOT NULL").fetchall()
+            all_prices = sorted(r[0] for r in all_rows)
+            median = all_prices[len(all_prices) // 2] if all_prices else car["price"]
+
+        car["median_comp"] = median
+        car["saving_pct"]  = round((car["price"] / median) * 100, 1)
+        scored.append(car)
+
+    scored.sort(key=lambda c: c["saving_pct"])
+    return scored
+
+
+def fetch_latest_listings(con, days_back: int = 3) -> list[dict]:
+    """Fetch all listings scraped within the last `days_back` days."""
+    since = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     rows = con.execute(
         """
-        SELECT listing_id, title, price, kilometres, year, make, model, url, date_scraped
+        SELECT listing_id, title, price, kilometres, year, make, model, url, date_scraped, listed_as, region_id
         FROM listings
         WHERE date_scraped >= ?
         """,
@@ -163,7 +213,7 @@ def fetch_latest_listings(con) -> list[dict]:
 
     listings = []
     for r in rows:
-        listing_id, title, price, kilometres, year, make, model, url, date_scraped = r
+        listing_id, title, price, kilometres, year, make, model, url, date_scraped, listed_as, region_id = r
         listings.append({
             "listing_id": listing_id,
             "title": title,
@@ -174,20 +224,29 @@ def fetch_latest_listings(con) -> list[dict]:
             "model": model,
             "url": url,
             "date_scraped": date_scraped,
+            "listed_as": listed_as,
+            "region_id": region_id,
         })
     return listings
 
 
 def apply_filter(listings: list[dict], fset: dict) -> list[dict]:
     """Return listings that match the given mail filter set criteria."""
+    days_back = fset.get("days_back", 3)
+    since = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+
     results = []
     for car in listings:
+        if car.get("date_scraped", "") < since:
+            continue
         make = fset.get("make")
         if make and make.lower() not in (car.get("make") or "").lower():
             continue
         model = fset.get("model")
-        if model and model.lower() not in (car.get("model") or "").lower():
-            continue
+        if model:
+            models = [model] if isinstance(model, str) else model
+            if not any(m.lower() in (car.get("model") or "").lower() for m in models):
+                continue
         year_min = fset.get("year_min")
         if year_min and car.get("year") and car["year"] < year_min:
             continue
@@ -200,26 +259,48 @@ def apply_filter(listings: list[dict], fset: dict) -> list[dict]:
         max_kms = fset.get("max_kms")
         if max_kms and car.get("kilometres") and car["kilometres"] > max_kms:
             continue
+        classifieds = fset.get("classifieds")
+        if classifieds is True and car.get("listed_as") != "classifieds":
+            continue
+        if classifieds is False and car.get("listed_as") != "auctions":
+            continue
+        region_id = fset.get("region_id")
+        if region_id is not None and car.get("region_id") != region_id:
+            continue
         results.append(car)
     return results
 
 
-def main():
+def main(selected_names: set | None = None):
+    mail_filter_sets = load_mail_filter_sets()
+    if not mail_filter_sets:
+        print("No filter sets configured. Add some in the UI or mailer_filters.json.")
+        return
+
+    if selected_names is not None:
+        mail_filter_sets = [f for f in mail_filter_sets if f.get("name") in selected_names]
+
     con = init_db()
-    latest_listings = fetch_latest_listings(con)
+    max_days = max((fset.get("days_back", 3) for fset in mail_filter_sets), default=3)
+    latest_listings = fetch_latest_listings(con, days_back=max_days)
     if not latest_listings:
         print("No listings found from the most recent scraper run.")
         con.close()
         return
 
-    for fset in MAIL_FILTER_SETS:
-        filter_name = " ".join(p for p in [fset.get("make"), fset.get("model")] if p) or "All"
+    for fset in mail_filter_sets:
+        model_str = "/".join(fset["model"]) if isinstance(fset.get("model"), list) else fset.get("model")
+        filter_name = fset.get("name") or " ".join(p for p in [fset.get("make"), model_str] if p) or "All"
         matched = apply_filter(latest_listings, fset)
         if not matched:
             print(f"No new listings for '{filter_name}'.")
             continue
 
-        deals = score_deals(con, matched)
+        deals = score_deals(
+            con, matched,
+            year_window=fset.get("year_window", 2),
+            km_window=fset.get("km_window"),
+        )
         if not deals:
             print(f"No scoreable deals for '{filter_name}'.")
             continue
@@ -232,4 +313,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--filters", type=str, default=None,
+                        help="Comma-separated filter set names to run (default: all)")
+    args = parser.parse_args()
+    selected = set(args.filters.split(",")) if args.filters else None
+    main(selected_names=selected)

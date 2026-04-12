@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block content %}
+
+<h4 class="mb-4">Dashboard</h4>
+
+<!-- Stats -->
+<div class="row g-3 mb-4">
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-body">
+        <div class="text-muted small mb-1">Total listings</div>
+        <div class="stat-number text-primary">{{ total }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-body">
+        <div class="text-muted small mb-1">Scraped today</div>
+        <div class="stat-number text-success">{{ today }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-body">
+        <div class="text-muted small mb-1">Last 7 days</div>
+        <div class="stat-number" style="color:#7c3aed;">{{ week }}</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Actions -->
+<div class="row g-3">
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-header">Run Scraper</div>
+      <div class="card-body">
+        <p class="text-muted small mb-3">
+          Scrapes TradeMe using your scraper filter sets and saves new listings to the database.
+          A browser window will open — this can take several minutes.
+        </p>
+        {% if scraper_names %}
+        <div class="mb-3">
+          {% for name in scraper_names %}
+          <div class="form-check">
+            <input class="form-check-input scraper-check" type="checkbox" value="{{ name }}" id="sc-{{ loop.index }}" checked>
+            <label class="form-check-label" for="sc-{{ loop.index }}">{{ name }}</label>
+          </div>
+          {% endfor %}
+        </div>
+        {% else %}
+        <p class="text-muted small">No filter sets configured — <a href="/filters">add some</a>.</p>
+        {% endif %}
+        <button class="btn btn-primary" id="scraper-btn" onclick="runJob('scraper')">Run Scraper</button>
+        <div id="scraper-output" class="mt-3" style="display:none;">
+          <pre class="output" id="scraper-pre"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-header">Run Mailer</div>
+      <div class="card-body">
+        <p class="text-muted small mb-3">
+          Scores recent listings and sends email reports based on your mailer filter sets.
+          Make sure you have run the scraper first.
+        </p>
+        {% if mailer_names %}
+        <div class="mb-3">
+          {% for name in mailer_names %}
+          <div class="form-check">
+            <input class="form-check-input mailer-check" type="checkbox" value="{{ name }}" id="mc-{{ loop.index }}" checked>
+            <label class="form-check-label" for="mc-{{ loop.index }}">{{ name }}</label>
+          </div>
+          {% endfor %}
+        </div>
+        {% else %}
+        <p class="text-muted small">No filter sets configured — <a href="/filters">add some</a>.</p>
+        {% endif %}
+        <button class="btn btn-success" id="mailer-btn" onclick="runJob('mailer')">Run Mailer</button>
+        <div id="mailer-output" class="mt-3" style="display:none;">
+          <pre class="output" id="mailer-pre"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+function runJob(type) {
+  const btn = document.getElementById(type + '-btn');
+  const outputDiv = document.getElementById(type + '-output');
+  const pre = document.getElementById(type + '-pre');
+
+  const checked = [...document.querySelectorAll('.' + type + '-check:checked')].map(el => el.value);
+
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+  outputDiv.style.display = 'block';
+  pre.textContent = 'Starting...';
+
+  fetch('/run/' + type, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filter_names: checked }),
+  })
+    .then(r => r.json())
+    .then(({ job_id }) => poll(job_id, type, btn, pre));
+}
+
+function poll(jobId, type, btn, pre) {
+  fetch('/run/status/' + jobId)
+    .then(r => r.json())
+    .then(job => {
+      pre.textContent = job.output;
+      pre.scrollTop = pre.scrollHeight;
+
+      if (job.done) {
+        btn.disabled = false;
+        btn.textContent = type === 'scraper' ? 'Run Scraper' : 'Run Mailer';
+        pre.style.borderTop = '3px solid ' + (job.ok ? '#16a34a' : '#dc2626');
+      } else {
+        setTimeout(() => poll(jobId, type, btn, pre), 1500);
+      }
+    });
+}
+</script>
+{% endblock %}
